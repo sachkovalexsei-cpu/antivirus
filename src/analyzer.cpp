@@ -2,10 +2,12 @@
 #include "av/analyzer.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <set>
 #include <span>
 #include <vector>
 
@@ -69,6 +71,24 @@ bool load_file(const std::string &path, uint64_t max_bytes,
     return !out.empty();
 }
 
+/// Same as load_file but tolerates empty files (a 0-byte file is "loaded"
+/// successfully with an empty buffer rather than reported as unreadable).
+static bool load_file_for_assess(const std::string &path, uint64_t max_bytes,
+                                 std::vector<std::byte> &out) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    auto sz = static_cast<uint64_t>(in.tellg());
+    if (sz > max_bytes) sz = max_bytes;
+    in.seekg(0);
+    out.resize(static_cast<size_t>(sz));
+    if (sz > 0) {
+        in.read(reinterpret_cast<char *>(out.data()),
+                static_cast<std::streamsize>(sz));
+        out.resize(static_cast<size_t>(in.gcount()));
+    }
+    return true;
+}
+
 /// Substring hunt for known-bad API names inside the raw image. Import lookup
 /// tables (PE .rdata) and .dynstr (ELF) store them as ASCIIZ strings, so a
 /// bounded byte scan is simple and effective as a first-pass heuristic.
@@ -79,6 +99,151 @@ static void hunt_suspicious_strings(const std::vector<std::byte> &buf,
     for (const char *api : kSuspiciousImports) {
         if (hay.find(api) != std::string_view::npos)
             rep.suspicious_imports.emplace_back(api);
+    }
+}
+
+/// Case-insensitive ASCII lowercase helper for DLL-name matching.
+static std::string lower_ascii(std::string s) {
+    for (auto &c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+/// Known-abused DLLs (credential theft / injection tooling).
+static bool abused_dll(std::string_view dll_lower) {
+    static constexpr const char *kAbused[] = {
+        "scansuite.dll", "dbghelp.dll", "winnsi.dll", "winsta.dll",
+        "netapi32.dll", "samlib.dll", "ntdll.dll",
+    };
+    for (auto d : kAbused)
+        if (dll_lower == d) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// PE import table walk: data dir [1] -> IMAGE_IMPORT_DESCRIPTOR array ->
+// INT/ILT thunks -> IMAGE_IMPORT_BY_NAME hints. All offsets bounds-checked.
+// ---------------------------------------------------------------------------
+static void parse_pe_imports(const std::vector<std::byte> &buf, Reader &r,
+                             uint32_t pe_off, uint16_t optsz, bool pe32plus,
+                             BinaryReport &rep) {
+    uint32_t dd_off = pe_off + 24 + (pe32plus ? 112u : 96u);
+    if (!r.inbounds(dd_off + 8 * 1, 8)) return; // no data directories
+    uint32_t imp_rva = r.le32(dd_off + 8 * 1);
+    uint32_t imp_sz  = r.le32(dd_off + 8 * 1 + 4);
+    if (imp_rva == 0 || imp_sz == 0 || imp_sz > 0x10000) return;
+
+    // RVA -> raw offset conversion using the section table.
+    uint32_t sec_off = pe_off + 24 + optsz;
+    uint16_t nsec = r.le16(pe_off + 6);
+    auto rva_to_off = [&](uint32_t rva) -> uint32_t {
+        for (uint16_t i = 0; i < nsec && i < 96; ++i) {
+            size_t so = sec_off + static_cast<size_t>(i) * 40;
+            if (!r.inbounds(so, 40)) break;
+            uint32_t va   = r.le32(so + 12);
+            uint32_t vsz  = r.le32(so + 8);
+            uint32_t raw  = r.le32(so + 20);
+            if (rva >= va && rva < va + vsz + 0x200u) // tolerate alignment slack
+                return raw + (rva - va);
+        }
+        return 0;
+    };
+
+    uint32_t imp_off = rva_to_off(imp_rva);
+    if (imp_off == 0 || !r.inbounds(imp_off, 20)) return;
+
+    const size_t thunk_sz = pe32plus ? 8 : 4;
+    const uint64_t ordinal_flag = pe32plus ? (1ull << 63) : (1u << 31);
+
+    for (int desc = 0; desc < 64; ++desc) { // cap descriptor count
+        size_t dobj = imp_off + static_cast<size_t>(desc) * 20;
+        if (!r.inbounds(dobj, 20)) break;
+        uint32_t name_rva  = r.le32(dobj + 12);
+        uint32_t orig_thunk = r.le32(dobj + 16);
+        uint32_t first_thunk = r.le32(dobj);
+        uint32_t thunk_rva = orig_thunk ? orig_thunk : first_thunk;
+        if (name_rva == 0 || thunk_rva == 0) break; // terminator
+
+        uint32_t name_off = rva_to_off(name_rva);
+        std::string dll;
+        if (name_off && r.inbounds(name_off, 2)) {
+            const char *s = reinterpret_cast<const char *>(buf.data()) + name_off;
+            size_t left = buf.size() - name_off;
+            dll = std::string(s, strnlen(s, std::min<size_t>(left, 64)));
+        }
+        if (abused_dll(lower_ascii(dll))) rep.suspicious_dll = true;
+
+        uint32_t thunk_off = rva_to_off(thunk_rva);
+        if (thunk_off == 0) continue;
+        for (int t = 0; t < 512; ++t) { // cap thunks per DLL
+            size_t to = thunk_off + static_cast<size_t>(t) * thunk_sz;
+            if (!r.inbounds(to, thunk_sz)) break;
+            uint64_t thunk = thunk_sz == 8 ? r.le64(to) : r.le32(to);
+            if (thunk == 0) break;                       // end of INT
+            if (thunk & ordinal_flag) {                  // import by ordinal
+                uint16_t ord = static_cast<uint16_t>(thunk & 0xFFFF);
+                std::string api = "#" + std::to_string(ord);
+                rep.imports.push_back({dll, api});
+                if (rep.imports.size() >= 2048) return;
+                continue;
+            }
+            uint32_t ibn_off = rva_to_off(static_cast<uint32_t>(thunk & 0x7FFFFFFF));
+            if (ibn_off == 0 || !r.inbounds(ibn_off, 4)) break;
+            const char *fn = reinterpret_cast<const char *>(buf.data()) + ibn_off + 2;
+            size_t left = buf.size() - (ibn_off + 2);
+            std::string api(fn, strnlen(fn, std::min<size_t>(left, 128)));
+            rep.imports.push_back({dll, api});
+            if (rep.imports.size() >= 2048) return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ELF dynamic symbol table (.dynsym/.dynstr): collect imported function names.
+// ---------------------------------------------------------------------------
+static void parse_elf_symbols(const std::vector<std::byte> &buf,
+                              uint64_t dynstr_off, uint64_t dynstr_sz,
+                              uint16_t shentsize, uint64_t shoff,
+                              uint16_t shnum, bool sym64,
+                              BinaryReport &rep) {
+    for (uint16_t i = 0; i < shnum; ++i) {
+        size_t ho = shoff + static_cast<size_t>(i) * shentsize;
+        if (ho + shentsize > buf.size()) break;
+        auto rd32h = [&](size_t o) -> uint32_t {
+            uint32_t v = 0;
+            for (int k = 0; k < 4; ++k)
+                v |= static_cast<uint32_t>(std::to_integer<uint8_t>(buf[o + k]))
+                     << (8 * k);
+            return v;
+        };
+        auto rd64h = [&](size_t o) -> uint64_t {
+            uint64_t v = 0;
+            for (int k = 0; k < 8; ++k)
+                v |= static_cast<uint64_t>(std::to_integer<uint8_t>(buf[o + k]))
+                     << (8 * k);
+            return v;
+        };
+        uint32_t type = rd32h(ho + 4); // SHT_DYNSYM == 11
+        if (type != 11) continue;
+        uint64_t off = sym64 ? rd64h(ho + 24) : rd32h(ho + 16);
+        uint64_t size = sym64 ? rd64h(ho + 32) : rd32h(ho + 20);
+        uint64_t entsz = sym64 ? 24 : 16;
+        if (entsz == 0 || size > (1ull << 31) || off + size > buf.size())
+            continue;
+        for (uint64_t s = 0; s + entsz <= size && rep.imports.size() < 2048; ++s) {
+            size_t so = off + static_cast<size_t>(s) * entsz;
+            uint32_t nameoff = rd32h(so);
+            uint8_t info = std::to_integer<uint8_t>(buf[so + (sym64 ? 4 : 12)]);
+            uint8_t stype = info & 0xF;
+            if (stype != 2) continue; // STT_FUNC only
+            if (nameoff == 0 || nameoff >= dynstr_sz) continue;
+            if (dynstr_off + nameoff >= buf.size()) continue;
+            const char *nm = reinterpret_cast<const char *>(buf.data()) +
+                             dynstr_off + nameoff;
+            size_t left = buf.size() - (dynstr_off + nameoff);
+            rep.imports.push_back({"", std::string(nm, strnlen(nm, std::min<size_t>(left, 128)))});
+        }
+        break; // first .dynsym is enough
     }
 }
 
@@ -96,6 +261,8 @@ void parse_pe(const std::vector<std::byte> &buf, BinaryReport &rep) {
     uint16_t machine = r.le16(pe_off + 4);
     uint16_t nsec = r.le16(pe_off + 6);
     uint16_t optsz = r.le16(pe_off + 20);
+    uint16_t magic = r.le16(pe_off + 24); // optional header magic
+    bool pe32plus = magic == 0x20b;
     switch (machine) {
     case 0x014c: rep.arch = "i386";    break;
     case 0x8664: rep.arch = "x86-64";  break;
@@ -121,6 +288,18 @@ void parse_pe(const std::vector<std::byte> &buf, BinaryReport &rep) {
         rep.max_section_entropy = std::max(rep.max_section_entropy, s.entropy);
         rep.sections.push_back(std::move(s));
     }
+
+    // PE image base (for potential future use) + data directories.
+    uint32_t dd_off = pe_off + 24 + (pe32plus ? 112u : 96u);
+    if (r.inbounds(dd_off, 8 * 10)) {
+        // Data directory index 9 = TLS directory. TLS callbacks run before
+        // the entry point and are a classic anti-debug / early-payload vector.
+        uint32_t tls_rva = r.le32(dd_off + 8 * 9);
+        uint32_t tls_sz  = r.le32(dd_off + 8 * 9 + 4);
+        rep.has_tls_callbacks = tls_rva != 0 && tls_sz >= 20;
+    }
+
+    parse_pe_imports(buf, r, pe_off, optsz, pe32plus, rep);
 
     hunt_suspicious_strings(buf, rep);
 
@@ -206,16 +385,23 @@ void parse_elf(const std::vector<std::byte> &buf, BinaryReport &rep) {
             size_t left = buf.size() - (stroff + nameoff);
             return std::string(s, strnlen(s, std::min<size_t>(left, 32)));
         };
+        uint64_t dynstr_off = 0, dynstr_sz = 0;
         for (uint16_t i = 0; i < shnum; ++i) {
             size_t ho = shoff + static_cast<size_t>(i) * shentsize;
             uint32_t nameoff = rd32(ho);
             uint64_t size = rd64(ho + 32);
             uint64_t off = rd64(ho + 24);
+            uint32_t type = rd32(ho + 4); // SHT_STRTAB == 3
             uint64_t flags = rd64(ho + 40); // SHF_EXECINSTR = 0x4
+            std::string nm = secname(nameoff);
+            if (type == 3 && nm == ".dynstr") {
+                dynstr_off = off;
+                dynstr_sz = size;
+            }
             if (size == 0 || size > (1ull << 31)) continue;
             if (off + size > buf.size()) continue;
             SectionInfo s;
-            s.name = secname(nameoff);
+            s.name = nm;
             s.raw_size = size;
             std::span<const std::byte> data(buf.data() + off,
                                             static_cast<size_t>(size));
@@ -225,24 +411,49 @@ void parse_elf(const std::vector<std::byte> &buf, BinaryReport &rep) {
             if ((flags & 0x4) && s.entropy > 7.2) rep.packed_heuristic = true;
             rep.sections.push_back(std::move(s));
         }
+        if (dynstr_sz > 0 && dynstr_off + dynstr_sz <= buf.size())
+            parse_elf_symbols(buf, dynstr_off, dynstr_sz, shentsize, shoff,
+                              shnum, /*sym64=*/true, rep);
     } else if (ei_class == 1) { // ---- ELF32 ----
         uint32_t shoff = rd32(0x10);
         uint16_t shentsize = static_cast<uint16_t>(rd16(0x2E));
         uint16_t shnum = static_cast<uint16_t>(rd16(0x30));
+        uint16_t shstrndx = static_cast<uint16_t>(rd16(0x32));
         if (shentsize < 40 || shnum == 0 || shnum > 4096 ||
             static_cast<uint64_t>(shoff) +
                     static_cast<uint64_t>(shnum) * shentsize > buf.size()) {
             rep.error = "suspicious ELF32 section header table";
             return;
         }
+        uint32_t str_hdr = shoff + static_cast<uint32_t>(shstrndx) * shentsize;
+        uint32_t stroff = rd32(str_hdr + 16);
+        uint32_t strsz  = rd32(str_hdr + 20);
+        auto secname = [&](uint32_t nameoff) -> std::string {
+            if (stroff >= buf.size() || nameoff >= strsz ||
+                static_cast<uint64_t>(stroff) + nameoff >= buf.size())
+                return "";
+            const char *s = reinterpret_cast<const char *>(buf.data()) +
+                            stroff + nameoff;
+            size_t left = buf.size() - (static_cast<size_t>(stroff) + nameoff);
+            return std::string(s, strnlen(s, std::min<size_t>(left, 32)));
+        };
+        uint64_t dynstr_off = 0, dynstr_sz = 0;
         for (uint16_t i = 0; i < shnum; ++i) {
             size_t ho = shoff + static_cast<size_t>(i) * shentsize;
+            uint32_t nameoff = rd32(ho);
+            uint32_t type = rd32(ho + 4);
             uint32_t size = rd32(ho + 16);
             uint32_t off = rd32(ho + 10);
+            std::string nm = secname(nameoff);
+            if (type == 3 && nm == ".dynstr") {
+                dynstr_off = off;
+                dynstr_sz = size;
+            }
             if (size == 0 || size > (1u << 31) ||
                 static_cast<uint64_t>(off) + size > buf.size())
                 continue;
             SectionInfo s;
+            s.name = nm;
             s.raw_size = size;
             std::span<const std::byte> data(buf.data() + off,
                                             static_cast<size_t>(size));
@@ -251,6 +462,9 @@ void parse_elf(const std::vector<std::byte> &buf, BinaryReport &rep) {
                                                s.entropy);
             rep.sections.push_back(std::move(s));
         }
+        if (dynstr_sz > 0 && dynstr_off + dynstr_sz <= buf.size())
+            parse_elf_symbols(buf, dynstr_off, dynstr_sz, shentsize, shoff,
+                              shnum, /*sym64=*/false, rep);
     }
 
     hunt_suspicious_strings(buf, rep);
@@ -277,13 +491,26 @@ static int yara_tag_score(std::string_view tag) {
     // Tag semantics defined by rules/*.yar: severe families score highest.
     if (tag == "trojan" || tag == "backdoor" || tag == "ransomware")
         return 70;
-    if (tag == "worm" || tag == "exploit" || tag == "spyware")
+    if (tag == "worm" || tag == "exploit" || tag == "spyware" ||
+        tag == "virus")
         return 60;
     if (tag == "miner" || tag == "downloader" || tag == "dropper")
         return 50;
     if (tag == "hacktool" || tag == "pua")
         return 30;
     return 20; // untagged match is still meaningful
+}
+
+/// True when a YARA rule name/tag clearly indicates a backdoor or RAT.
+static bool is_backdoor_rule(const YaraMatch &m) {
+    auto has = [](std::string_view s, std::string_view sub) {
+        std::string lo(s), q(sub);
+        for (auto &c : lo) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (auto &c : q)  c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return lo.find(q) != std::string::npos;
+    };
+    return has(m.tag, "backdoor") || has(m.rule, "backdoor") ||
+           has(m.rule, "rat") || has(m.tag, "rat") || has(m.rule, "c2_");
 }
 
 double compute_threat_score(const ScoreComponents &c) {
@@ -297,12 +524,21 @@ double compute_threat_score(const ScoreComponents &c) {
     if (c.high_entropy) score += 25;
     if (c.binary_packed) score += 10;
     score += std::min(15.0, 3.0 * c.suspicious_imports);
-    if (c.access_error) score += 5; // blind spot deserves attention
+    if (c.has_tls_callbacks) score += 8; // PE TLS callback anti-analysis vector
+    if (c.access_error) score += 5;      // blind spot deserves attention
     return std::min(100.0, score);
 }
 
 Verdict verdict_from_score(const ScoreComponents &c, double score) {
     if (c.hash_match && c.hash_severity >= 80) return Verdict::Malicious;
+    // A confirmed backdoor/RAT YARA signature alone is enough to convict.
+    for (auto &r : c.yara_rules) {
+        std::string lo = r;
+        for (auto &ch : lo) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (lo.find("backdoor") != std::string::npos || lo.find("_rat") != std::string::npos ||
+            lo.find("c2_") != std::string::npos)
+            return Verdict::Malicious;
+    }
     if (score >= 80.0) return Verdict::Malicious;
     if (score >= 40.0) return Verdict::Suspicious;
     return Verdict::Clean;
@@ -332,42 +568,68 @@ ThreatAssessment assess_with_engines(const std::string &file_path,
         a.components.access_error = herr != "file exceeds size cap";
     }
 
+    // Load the image once for both YARA memory scanning and static analysis.
+    // This also lets us compute an accurate whole-file entropy from the same
+    // bytes we already have in memory (fixes duplicate I/O).
+    std::vector<std::byte> buf;
+    const bool loaded = load_file_for_assess(file_path, max_file_bytes, buf);
+
     // --- 2. YARA rule matches ---------------------------------------------------
-    if (yara && yara->has_rules()) {
+    bool backdoor_hit = false;
+    if (yara && yara->has_rules() && loaded) {
         std::vector<YaraMatch> matches;
-        if (yara->scan_file(file_path, matches) == 0) {
+        if (yara->scan_mem(buf, matches) == 0) {
             int best = 0;
             for (auto &m : matches) {
                 a.components.yara_rules.push_back(m.rule);
                 best = std::max(best, yara_tag_score(m.tag));
+                if (is_backdoor_rule(m)) backdoor_hit = true;
             }
             a.components.yara_tags_score = best;
         }
     }
 
     // --- 3. Shannon entropy (>7.5 flagged) --------------------------------------
-    std::string eerr;
-    if (auto e = file_entropy(file_path, max_file_bytes, &eerr)) {
-        a.components.entropy = e->entropy_bits_per_byte;
-        a.components.high_entropy = e->entropy_bits_per_byte > 7.5;
+    if (loaded && !buf.empty()) {
+        // Sample up to 2 MiB centred on the start for scoring stability.
+        std::span<const std::byte> win(buf.data(),
+                                       std::min<size_t>(buf.size(), 2u << 20));
+        double e = span_entropy(win);
+        a.components.entropy = e;
+        a.components.high_entropy = e > 7.5;
+    } else if (!loaded && !a.components.access_error) {
+        std::string eerr;
+        if (auto e = file_entropy(file_path, max_file_bytes, &eerr)) {
+            a.components.entropy = e->entropy_bits_per_byte;
+            a.components.high_entropy = e->entropy_bits_per_byte > 7.5;
+        }
     }
 
     // --- 4. Static PE/ELF inspection ---------------------------------------------
-    if (sha) {
-        BinaryReport br = inspect_binary(file_path, max_file_bytes);
+    if (loaded) {
+        BinaryReport br;
+        parse_pe(buf, br);
+        if (!br.is_pe) parse_elf(buf, br);
         if (br.is_pe || br.is_elf) {
             a.components.binary_packed = br.packed_heuristic;
-            a.components.suspicious_imports =
-                static_cast<int>(br.suspicious_imports.size());
+            a.components.has_tls_callbacks = br.has_tls_callbacks;
+            // Unique suspicious API names (the substring hunt can hit the same
+            // name in several tables).
+            std::set<std::string> uniq(br.suspicious_imports.begin(),
+                                       br.suspicious_imports.end());
+            a.components.suspicious_imports = static_cast<int>(uniq.size());
         }
     }
 
     // --- 5. Unified verdict --------------------------------------------------------
     a.score = compute_threat_score(a.components);
     a.verdict = verdict_from_score(a.components, a.score);
+    if (backdoor_hit) a.verdict = Verdict::Malicious;
 
     if (a.components.hash_match)
         a.threat_name = a.components.hash_threat_name;
+    else if (backdoor_hit)
+        a.threat_name = "Backdoor.Generic";
     else if (!a.components.yara_rules.empty())
         a.threat_name = "YARA:" + a.components.yara_rules.front();
     else if (a.verdict != Verdict::Clean)

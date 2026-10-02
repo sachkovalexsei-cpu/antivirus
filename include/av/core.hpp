@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
@@ -61,15 +62,22 @@ public:
     void end_arr(bool comma = false);
     void key(std::string_view k);
     void value(std::string_view v);            // string
-    void value_raw(std::string_view raw_json); // numbers, bools, nested json
+    void value(bool b);                        // must be a real overload: a
+                                               // bare template would lose to
+                                               // value(string_view) for bools
+    void value_raw(std::string_view raw_json); // numbers, nested json
     template <typename T>
-        requires std::is_arithmetic_v<T> || std::is_same_v<T, bool>
+        requires std::is_integral_v<T> && !std::same_as<T, bool>
     void value(T n) {
         val_sep();
-        if constexpr (std::is_same_v<T, bool>)
-            buf_ += n ? "true" : "false";
-        else
-            buf_ += std::to_string(n);
+        buf_ += std::to_string(n);
+        pending_elem_ = true;
+    }
+    template <typename T>
+        requires std::is_floating_point_v<T>
+    void value(T n) {
+        val_sep();
+        buf_ += std::format("{:.4f}", static_cast<double>(n));
         pending_elem_ = true;
     }
 

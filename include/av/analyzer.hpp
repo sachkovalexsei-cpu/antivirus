@@ -1,6 +1,7 @@
 // analyzer.hpp - PE/ELF static inspection + unified threat scoring (Phase 2).
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -9,6 +10,11 @@ namespace av {
 // ---------------------------------------------------------------------------
 // Static binary analysis
 // ---------------------------------------------------------------------------
+struct ImportInfo {
+    std::string dll;  // PE: DLL name (empty for ELF)
+    std::string api;  // imported function / symbol name
+};
+
 struct SectionInfo {
     std::string name;
     uint64_t raw_size = 0;
@@ -21,8 +27,12 @@ struct BinaryReport {
     std::string arch;                // e.g. "x86-64", "aarch64", "i386"
     std::vector<SectionInfo> sections;
     std::vector<std::string> suspicious_imports; // matched API names
+    std::vector<ImportInfo> imports;   // full import table (capped)
+    std::vector<std::string> yara_hits; // backdoor/virus rule names (filled by scorer)
     double max_section_entropy = 0.0;
     bool packed_heuristic = false;   // high-entropy .text/.upx or unnamed sect
+    bool has_tls_callbacks = false;  // PE: TLS directory present (anti-debug vector)
+    bool suspicious_dll = false;     // imports from known-abused DLLs
     std::string error;               // parse failure note (non-fatal)
 };
 
@@ -46,6 +56,12 @@ inline constexpr const char *kSuspiciousImports[] = {
     // Linux / libc equivalents
     "ptrace", "dlopen", "mmap", "execve", "/bin/sh", "/dev/tcp",
     "LD_PRELOAD", "PTRACE_TRACEME",
+    // Backdoor / RAT / cracker tool indicators
+    "bind", "listen", "accept", "recv", "send", "shutdown",
+    "CreateNamedPipeA", "CreateNamedPipeW", "ConnectNamedPipe",
+    "cmd.exe", "powershell", "nc -e", "/dev/null 2>&1",
+    "crackstation", "hashcat", "mimikatz", "sekurlsa::logonpasswords",
+    "LSASS", "secretsdump", "psexec", "wmic",
 };
 
 // ---------------------------------------------------------------------------
@@ -63,6 +79,7 @@ struct ScoreComponents {
     bool high_entropy = false;      // entropy > 7.5
     bool binary_packed = false;     // packed/exec-section heuristic
     int suspicious_imports = 0;     // count
+    bool has_tls_callbacks = false; // PE TLS callback (anti-analysis)
     bool access_error = false;      // could not read fully
 };
 

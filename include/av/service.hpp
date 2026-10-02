@@ -25,6 +25,11 @@ struct ServiceConfig {
     std::vector<std::string> watch_paths;
 };
 
+/// Process-wide active service pointer (set in DetectionService::init,
+/// cleared in the destructor). Lets the free function
+/// calculate_threat_score() reuse the running engines when present.
+DetectionService *active_service();
+
 /// Callback signature for events (alerts / progress) destined for IPC push.
 using EventSink = std::function<void(const std::string &json_line)>;
 

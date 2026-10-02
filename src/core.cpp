@@ -12,6 +12,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -263,6 +264,12 @@ void JsonWriter::value(std::string_view v) {
     buf_ += '"';
     buf_ += json_escape(v);
     buf_ += '"';
+    pending_elem_ = true;
+}
+
+void JsonWriter::value(bool b) {
+    val_sep();
+    buf_ += b ? "true" : "false";
     pending_elem_ = true;
 }
 
